@@ -1,26 +1,15 @@
 /**
- * Digital Tape Delay for Electro-Smith Daisy Patch Submodule
- * 
- * HARDWARE CONNECTIONS:
+ * Gen~ Modeled Tape Delay for Electro-Smith Daisy Patch Submodule
+ * * Modeled after 'gentildacode.cpp'
+ * * HARDWARE CONNECTIONS:
  * ---------------------
  * Knobs (left to right):
- * 1. Time     -> ADC 9  (delay time 10ms-10000ms)
- * 2. Feedback -> CV 7   (feedback amount 0-95%)
- * 3. Mix      -> CV 8   (dry/wet mix)
- * 4. Filter   -> ADC 10 (lowpass filter cutoff)
- * 5. Flutter  -> ADC 11 (tape wow/flutter amount)
- * 
- * CV Input Jacks:
- * - CV 1-5    -> Modulate the parameters above
- * - CV 6      -> Filter Cutoff CV
- * 
- * Control:
- * - Gate In 1 -> Clock/Tap Tempo input
- * - Button D1 -> Manual tap tempo
- * - Button D2 -> Ping-pong mode toggle
- * - LED B8    -> Tempo indicator (PWM)
- * 
- * Audio:
+ * 1. Time     -> ADC 9  (Delay Time)
+ * 2. Feedback -> CV 7   (Intensity)
+ * 3. Mix      -> CV 8   (Dry/Wet)
+ * 4. Filter   -> ADC 10 (Tone/Bandwidth)
+ * 5. Flutter  -> ADC 11 (Wow/Flutter Amount)
+ * * Audio:
  * - Audio In  -> L/R stereo input
  * - Audio Out -> L/R stereo output
  */
@@ -33,294 +22,233 @@ using namespace daisy;
 using namespace patch_sm;
 using namespace daisysp;
 
-// Hardware object
 DaisyPatchSM patch;
 
-// Delay time configuration - adjust these to change delay range
-#define MAX_DELAY_TIME_SEC 2.0f  // Maximum delay time in seconds
-#define MIN_DELAY_TIME_MS 10.0f   // Minimum delay time in milliseconds
-#define DELAY_TIME_CURVE 3.0f     // Curve exponent (higher = more control at short times)
-
-// Maximum delay buffer size
+// Configuration
+#define MAX_DELAY_TIME_SEC 2.0f
 #define MAX_DELAY static_cast<size_t>(48000 * MAX_DELAY_TIME_SEC)
 
-// DSP modules - delay lines in SDRAM
+// Buffers
 DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delMems[2];
 
-// Delay structure (adapted from MultiDelay)
-struct delay
-{
-    DelayLine<float, MAX_DELAY> *del;
-    float                        currentDelay;
-    float                        delayTarget;
-    float                        dc_block_x1;  // DC blocker state
-    float                        dc_block_y1;
+// --------------------------------------------------------------------------
+// GEN~ PORTED FUNCTIONS
+// --------------------------------------------------------------------------
 
-    void Init()
-    {
-        dc_block_x1 = 0.0f;
-        dc_block_y1 = 0.0f;
-    }
+// Tanh Lambert Approximation (from gentildacode.cpp 'tnhLam')
+// This provides the specific non-linear saturation curve of the tape.
+float tnhLam(float x) {
+    float x2 = x * x;
+    float a = (((x2 + 378.0f) * x2 + 17325.0f) * x2 + 135135.0f) * x;
+    float b = ((28.0f * x2 + 3150.0f) * x2 + 62370.0f) * x2 + 135135.0f;
+    float res = a / b;
+    return fclamp(res, -1.0f, 1.0f);
+}
 
-    float Process(float feedback, float in)
-    {
-        //set delay times with smoothing
-        fonepole(currentDelay, delayTarget, .0002f);
-        del->SetDelay(currentDelay);
+// Static limit, processes at 1, limits at 4 (from gentildacode.cpp 'softStatic')
+// Used at the output stage to round off peaks.
+float softStatic(float x) {
+    if (x > 1.0f)
+        return (1.0f - 4.0f / (x + 3.0f)) * 4.0f + 1.0f;
+    else if (x < -1.0f)
+        return (1.0f + 4.0f / (x - 3.0f)) * -4.0f - 1.0f;
+    else
+        return x;
+}
 
-        float read = del->Read();
+// 6dB One Pole Filter (from gentildacode.cpp 'eAllPoleLPHP6')
+// Type 0 = LP, Type 1 = HP (Imperfect)
+struct OnePole6dB {
+    float y0 = 0.0f;
+    float sample_rate;
+
+    void Init(float sr) { sample_rate = sr; }
+
+    float Process(float x, float cutoff, int type) {
+        // approx sin(cutoff * 2pi / sr)
+        float f = fclamp(sinf(cutoff * TWOPI_F / sample_rate), 0.00001f, 0.99999f);
         
-        // DC blocking filter to prevent DC offset accumulation in feedback
-        // y[n] = x[n] - x[n-1] + 0.995 * y[n-1]
-        float dc_blocked = read - dc_block_x1 + 0.995f * dc_block_y1;
-        dc_block_x1 = read;
-        dc_block_y1 = dc_blocked;
-        
-        // Soft limit feedback to prevent runaway (tanh saturation)
-        float feedback_signal = feedback * dc_blocked;
-        feedback_signal = tanhf(feedback_signal * 1.2f) * 0.95f;  // Gentler limiting
-        
-        del->Write(feedback_signal + in);
+        // lp = mix(y0, x, f);
+        float lp = y0 + f * (x - y0);
+        y0 = lp;
 
-        return dc_blocked;
+        if (type == 1) {
+            return lp - x; // Intentionally "wrong" HP from gen~ script
+        } else {
+            return lp;     // Lowpass
+        }
     }
 };
 
-delay delays[2];  // Left and Right channels
+// --------------------------------------------------------------------------
+// TAPE SYSTEM STRUCT
+// --------------------------------------------------------------------------
 
-// Filters and effects
-Svf lowpass_left, lowpass_right;
-Oscillator lfo_flutter;
-GPIO led_pin;
-
-// Control variables
-float delay_time_samples = 24000.0f;  // Default ~500ms at 48kHz
-float feedback_amount = 0.5f;
-float filter_cutoff = 8000.0f;
-float flutter_amount = 0.0f;
-float dry_wet_mix = 0.5f;
-
-// CV modulation values
-float cv_mod[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-
-// Button and tempo control
-Switch tap_button, mode_button;
-bool ping_pong_mode = false;
-uint32_t last_tap_time = 0;
-uint32_t tap_count = 0;
-float tap_tempo_ms = 500.0f;
-bool use_tap_tempo = false;
-
-// LED brightness for tempo indication
-float led_brightness = 0.0f;
-uint32_t last_led_toggle = 0;
-
-// Helper function to map CV input to parameter range
-inline float MapCvInput(float cv_value, float min_val, float max_val) {
-    float normalized = fclamp(cv_value, 0.0f, 1.0f);
-    return min_val + normalized * (max_val - min_val);
-}
-
-void ProcessControls() {
-    // Read all analog controls
-    patch.ProcessAnalogControls();
+struct TapeHead {
+    DelayLine<float, MAX_DELAY> *del;
+    OnePole6dB lpFilter;
+    OnePole6dB hpFilter;
     
-    // Process gate inputs for clock sync
-    if (patch.gate_in_1.Trig()) {
-        uint32_t current_time = System::GetNow();
-        if (tap_count > 0 && (current_time - last_tap_time) < 10000) {
-            tap_tempo_ms = current_time - last_tap_time;
-            tap_tempo_ms = fclamp(tap_tempo_ms, 10.0f, 10000.0f);
-            delay_time_samples = (tap_tempo_ms / 1000.0f) * patch.AudioSampleRate();
-            use_tap_tempo = true;
-        }
-        last_tap_time = current_time;
-        tap_count++;
+    // States
+    float currentDelay = 24000.0f;
+    float targetDelay = 24000.0f;
+    float dc_x = 0.0f; // For final DC blocking
+    float dc_y = 0.0f;
+
+    void Init(float sr) {
+        lpFilter.Init(sr);
+        hpFilter.Init(sr);
     }
-    
-    // Read knob values
-    float knob_time = patch.GetAdcValue(ADC_9);
-    float knob_feedback = patch.GetAdcValue(CV_7);
-    float knob_mix = patch.GetAdcValue(CV_8);
-    float knob_filter = patch.GetAdcValue(ADC_10);
-    float knob_flutter = patch.GetAdcValue(ADC_11);
-    
-    // Read CV inputs for modulation
-    cv_mod[0] = patch.GetAdcValue(CV_1);  // Time CV
-    cv_mod[1] = patch.GetAdcValue(CV_2);  // Feedback CV
-    cv_mod[2] = patch.GetAdcValue(CV_3);  // Mix CV
-    cv_mod[3] = patch.GetAdcValue(CV_4);  // Filter CV
-    cv_mod[4] = patch.GetAdcValue(CV_5);  // Flutter CV
-    
-    // Filter cutoff from CV6 jack
-    float cv_filter = patch.GetAdcValue(CV_6);
-    
-    // Calculate final parameter values with CV modulation
-    float final_time = fclamp(knob_time + cv_mod[0] * 0.5f, 0.0f, 1.0f);
-    // Scale feedback to be between 0 and 2
-    float final_feedback = fclamp((knob_feedback + cv_mod[1] * 0.3f) * 1.2f, 0.0f, 2.0f);
-    float final_mix = fclamp(knob_mix + cv_mod[2] * 0.3f, 0.0f, 1.0f);
-    float final_filter = fclamp(knob_filter + cv_mod[3] * 0.3f + cv_filter * 0.3f, 0.0f, 1.0f);
-    float final_flutter = fclamp(knob_flutter + cv_mod[4] * 0.2f, 0.0f, 1.0f);
-    
-    // Map parameters to useful ranges
-    if (!use_tap_tempo) {
-        // Apply curve for more control at shorter delay times
-        // Using cubic curve (or configurable exponent) for finer control at low values
-        float time_curve = powf(final_time, DELAY_TIME_CURVE);
+
+    // Main Signal Path
+    // Flow: Input+Fb -> Saturation -> Write -> Read -> Filter -> Output
+    float Process(float in, float feedback_signal, float delay_samps, float tone_freq) {
         
-        // Map from minimum to maximum delay time
-        float min_delay_samples = patch.AudioSampleRate() * (MIN_DELAY_TIME_MS / 1000.0f);
-        float max_delay_samples = MAX_DELAY - 1;
-        delay_time_samples = MapCvInput(time_curve, min_delay_samples, max_delay_samples);
-    }
-    
-    feedback_amount = final_feedback;
-    filter_cutoff = MapCvInput(final_filter, 80.0f, 12000.0f);
-    flutter_amount = final_flutter * 0.05f;
-    dry_wet_mix = final_mix;
-    
-    // Update filter cutoffs
-    lowpass_left.SetFreq(filter_cutoff);
-    lowpass_right.SetFreq(filter_cutoff);
-    
-    // Update delay targets
-    delays[0].delayTarget = delay_time_samples;
-    delays[1].delayTarget = delay_time_samples;
-    
-    // Process buttons
-    tap_button.Debounce();
-    mode_button.Debounce();
-    
-    // Handle tap tempo
-    if (tap_button.RisingEdge()) {
-        uint32_t current_time = System::GetNow();
-        if (tap_count > 0 && (current_time - last_tap_time) < 10000) {
-            tap_tempo_ms = current_time - last_tap_time;
-            tap_tempo_ms = fclamp(tap_tempo_ms, 10.0f, 10000.0f);
-            delay_time_samples = (tap_tempo_ms / 1000.0f) * patch.AudioSampleRate();
-            use_tap_tempo = true;
-            tap_count++;
-        } else {
-            tap_count = 1;
-            use_tap_tempo = false;
-        }
-        last_tap_time = current_time;
-    }
-    
-    // Handle mode toggle
-    if (mode_button.RisingEdge()) {
-        ping_pong_mode = !ping_pong_mode;
-    }
-    
-    // Reset tap tempo if time knob is moved significantly
-    static float last_knob_time = 0.0f;
-    if (fabs(knob_time - last_knob_time) > 0.05f) {
-        use_tap_tempo = false;
-    }
-    last_knob_time = knob_time;
-}
+        // 1. INPUT MIX & SATURATION (Amp Simulation Stage)
+        // In the gen~ script, saturation happens *before* writing to tape
+        float dry_signal = in + feedback_signal;
+        
+        // Apply 'tnhLam' Saturation (Tape Saturation)
+        // We boost slightly into it to drive the saturation, simulating input gain
+        float saturated_signal = tnhLam(dry_signal * 1.3f);
 
-void ProcessLED() {
-    // Calculate LED blink rate based on delay time
-    float delay_time_ms = (delay_time_samples / patch.AudioSampleRate()) * 1000.0f;
-    uint32_t current_time = System::GetNow();
-    
-    // Toggle LED at delay tempo
-    if (current_time - last_led_toggle > delay_time_ms) {
-        led_brightness = led_brightness > 0.5f ? 0.0f : 1.0f;
-        last_led_toggle = current_time;
+        // 2. WRITE TO TAPE
+        del->Write(saturated_signal);
+
+        // 3. READ FROM TAPE (Capstan Stage)
+        // Smooth delay time changes
+        fonepole(currentDelay, delay_samps, 0.0005f);
+        
+        // Use Hermite Interpolation (Cubic) as requested by gen~ code (interp="cubic")
+        float tape_out = del->ReadHermite(currentDelay);
+
+        // 4. FILTERING (Trap Filters Stage - Topology 0 "201")
+        // The gen~ script uses a chain of OnePole LP -> OnePole HP
+        
+        // LP: Tone control
+        float lp_out = lpFilter.Process(tape_out, tone_freq, 0); 
+        
+        // HP: Fixed rumble filter (approx 147Hz in gen~)
+        float hp_out = hpFilter.Process(lp_out, 147.0f, 1);
+        
+        // 5. OUTPUT STAGE
+        // DC Block (standard)
+        float clean_out = hp_out - dc_x + 0.995f * dc_y;
+        dc_x = hp_out;
+        dc_y = clean_out;
+
+        return softStatic(clean_out);
     }
-    
-    led_pin.Write(led_brightness > 0.5f);
+};
+
+TapeHead heads[2];
+Oscillator flutterLfo;
+Oscillator flutterLfo2; // Secondary LFO for complex wobble
+float sample_rate;
+
+// Control Vars
+float cv_time = 0.5f;
+float cv_feedback = 0.0f;
+float cv_mix = 0.5f;
+float cv_tone = 2000.0f;
+float cv_flutter = 0.0f;
+
+// Helper to map 0-1 to Frequency Logarithmically
+float MapLog(float input, float min_freq, float max_freq) {
+    input = fclamp(input, 0.0f, 1.0f);
+    return min_freq * powf(max_freq / min_freq, input);
 }
 
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
-    ProcessControls();
-    ProcessLED();
+    patch.ProcessAnalogControls();
+
+    // ----------------------
+    // CONTROL PROCESSING
+    // ----------------------
     
+    // 1. Time (Tape Speed)
+    // Inverse curve: Lower values = Longer delay (Slower tape)
+    float raw_time = patch.GetAdcValue(ADC_9) + patch.GetAdcValue(CV_1);
+    raw_time = fclamp(raw_time, 0.0f, 1.0f);
+    float target_delay_ms = 10.0f + (powf(raw_time, 2.5f) * 1500.0f); // Up to 1.5s
+    float target_delay_samps = (target_delay_ms / 1000.0f) * sample_rate;
+
+    // 2. Feedback (Intensity)
+    float raw_fb = patch.GetAdcValue(CV_7) + patch.GetAdcValue(CV_2);
+    // Gen~ script allows feedback > 1.0 for self oscillation
+    float feedback_amt = fclamp(raw_fb * 1.1f, 0.0f, 1.2f); 
+
+    // 3. Filter (Tone)
+    float raw_filter = patch.GetAdcValue(ADC_10) + patch.GetAdcValue(CV_4) + patch.GetAdcValue(CV_6);
+    // Maps roughly 400Hz to 18kHz
+    float tone_freq = MapLog(raw_filter, 400.0f, 18000.0f);
+
+    // 4. Flutter (Wow)
+    float raw_flutter = patch.GetAdcValue(ADC_11) + patch.GetAdcValue(CV_5);
+    float flutter_depth = fclamp(raw_flutter, 0.0f, 1.0f) * 60.0f; // Depth in samples
+
+    // 5. Mix
+    float raw_mix = patch.GetAdcValue(CV_8) + patch.GetAdcValue(CV_3);
+    float dry_wet = fclamp(raw_mix, 0.0f, 1.0f);
+
+    // ----------------------
+    // AUDIO LOOP
+    // ----------------------
+    
+    // Static state for ping-pong-ish feedback cross
+    static float feedL = 0.0f;
+    static float feedR = 0.0f;
+
     for (size_t i = 0; i < size; i++) {
-        float input_left = in[0][i];
-        float input_right = in[1][i];
-        
-        // Apply fixed soft clipping to inputs (tanh saturation)
-        float clipped_left = tanhf(input_left * 1.5f);
-        float clipped_right = tanhf(input_right * 1.5f);
-        
-        // Pitch flutter: modulate delay time for tape-style wow/flutter
-        float flutter_mod = lfo_flutter.Process() * flutter_amount;
-        float modulated_delay_time = delay_time_samples * (1.0f + flutter_mod);
-        modulated_delay_time = fclamp(modulated_delay_time, 1.0f, MAX_DELAY - 1);
-        
-        // Update delay targets with flutter modulation
-        delays[0].delayTarget = modulated_delay_time;
-        delays[1].delayTarget = modulated_delay_time;
-        
-        // Process delays with feedback (using MultiDelay structure)
-        float delayed_left = delays[0].Process(feedback_amount, clipped_left);
-        float delayed_right = delays[1].Process(feedback_amount, clipped_right);
-        
-        // Apply lowpass filtering to delayed signals
-        lowpass_left.Process(delayed_left);
-        delayed_left = lowpass_left.Low();
-        lowpass_right.Process(delayed_right);
-        delayed_right = lowpass_right.Low();
-        
-        // Ping-pong mode: cross-feed the delays
-        if (ping_pong_mode) {
-            float temp = delayed_left;
-            delayed_left = (delayed_left + delayed_right) * 0.707f;  // -3dB
-            delayed_right = (temp + delayed_right) * 0.707f;
-        }
-        
-        // Mix dry and wet signals
-        out[0][i] = input_left * (1.0f - dry_wet_mix) + delayed_left * dry_wet_mix;
-        out[1][i] = input_right * (1.0f - dry_wet_mix) + delayed_right * dry_wet_mix;
+        // Calculate Flutter
+        // Gen~ uses complex "Capstan" logic. We approx this by summing two LFOs
+        // to create a non-cyclic feeling wobble.
+        float wob = flutterLfo.Process();
+        float wob2 = flutterLfo2.Process(); 
+        float total_flutter = (wob + (wob2 * 0.5f)) * flutter_depth;
+
+        float delay_L_samps = fclamp(target_delay_samps + total_flutter, 10.0f, (float)MAX_DELAY - 100.0f);
+        // Slight offset for Right channel for stereo width
+        float delay_R_samps = fclamp(target_delay_samps + total_flutter + 50.0f, 10.0f, (float)MAX_DELAY - 100.0f);
+
+        // Process Tape Heads
+        // Note: We feed the *previous* output back into the input (Feedback)
+        float outL = heads[0].Process(in[0][i], feedL * feedback_amt, delay_L_samps, tone_freq);
+        float outR = heads[1].Process(in[1][i], feedR * feedback_amt, delay_R_samps, tone_freq);
+
+        // Store Feedback for next cycle (Simple Cross Feed for stereo swirl)
+        // Gen~ logic for feedback routing is complex, but often simple stereo is best for hardware
+        feedL = outL; 
+        feedR = outR;
+
+        // Final Mix
+        out[0][i] = (in[0][i] * (1.0f - dry_wet)) + (outL * dry_wet);
+        out[1][i] = (in[1][i] * (1.0f - dry_wet)) + (outR * dry_wet);
     }
 }
 
 int main(void) {
-    // Initialize hardware
     patch.Init();
-    
-    float sample_rate = patch.AudioSampleRate();
-    
-    // Initialize delay lines (MultiDelay style)
-    for(int i = 0; i < 2; i++)
-    {
+    sample_rate = patch.AudioSampleRate();
+
+    // Init Delays
+    for(int i = 0; i < 2; i++) {
         delMems[i].Init();
-        delays[i].del = &delMems[i];
-        delays[i].currentDelay = delay_time_samples;
-        delays[i].delayTarget = delay_time_samples;
-        delays[i].Init();  // Initialize DC blocker
+        heads[i].del = &delMems[i];
+        heads[i].Init(sample_rate);
     }
-    
-    // Initialize filters
-    lowpass_left.Init(sample_rate);
-    lowpass_right.Init(sample_rate);
-    lowpass_left.SetFreq(filter_cutoff);
-    lowpass_right.SetFreq(filter_cutoff);
-    lowpass_left.SetRes(0.1f);
-    lowpass_right.SetRes(0.1f);
-    
-    // Initialize flutter LFO
-    lfo_flutter.Init(sample_rate);
-    lfo_flutter.SetWaveform(Oscillator::WAVE_SIN);
-    lfo_flutter.SetFreq(3.2f);
-    lfo_flutter.SetAmp(1.0f);
-    
-    // Initialize LED pin (B8)
-    led_pin.Init(DaisyPatchSM::B8, GPIO::Mode::OUTPUT);
-    
-    // Initialize buttons
-    tap_button.Init(DaisyPatchSM::D1, patch.AudioCallbackRate());
-    mode_button.Init(DaisyPatchSM::D2, patch.AudioCallbackRate());
-    
-    // Start audio processing
+
+    // Init LFOs for Flutter
+    flutterLfo.Init(sample_rate);
+    flutterLfo.SetWaveform(Oscillator::WAVE_SIN);
+    flutterLfo.SetFreq(0.4f); // Slow capstan eccentricity
+    flutterLfo.SetAmp(1.0f);
+
+    flutterLfo2.Init(sample_rate);
+    flutterLfo2.SetWaveform(Oscillator::WAVE_TRI);
+    flutterLfo2.SetFreq(3.5f); // Faster motor flutter
+    flutterLfo2.SetAmp(0.3f);
+
     patch.StartAudio(AudioCallback);
-    
-    // Main loop
-    while(1) {
-        System::Delay(1);
-    }
+    while(1) { }
 }
