@@ -1,4 +1,4 @@
-# TapeDelay: Gen~ Modeled Tape Delay for Daisy Patch SM
+# TapeDelay: Modeled Tape Delay for Daisy Patch SM
 
 ## Overview
 
@@ -70,6 +70,8 @@ Algorithm and code inspired by Magnetic M4L device Gen~ tape delay techniques. H
 ## Building and Installation
 
 *You might have to adapt the hardware connections to suit for example if you are using a daisy patch init or something else.*
+
+Look at hwtest/hwtest.cpp to see how exactly my hardware was wired up.
 
 1. Clone this repository into the `./DaisyExamples` directory to get `./DaisyExamples/tape-delay-daisysm/`.
 2. Make sure the `libDaisy` submodule is correctly initialized in `./DaisyExamples/libDaisy/`.
