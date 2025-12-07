@@ -1,8 +1,8 @@
 # Project Name
-TARGET = QareebiEcho2
+TARGET = TapeDelay
 
 # Sources
-CPP_SOURCES = QareebiEcho2.cpp
+CPP_SOURCES = TapeDelay.cpp
 
 # Library Locations
 LIBDAISY_DIR = ../../libDaisy/
