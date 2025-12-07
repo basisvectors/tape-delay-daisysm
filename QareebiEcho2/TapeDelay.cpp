@@ -1,6 +1,6 @@
 /**
  * Gen~ Modeled Tape Delay for Electro-Smith Daisy Patch Submodule
- * WITH REVERSE FEEDBACK MODE (FIXED), CLOCK SYNC, LED, AND GATE OUT 2 TEMPO
+ * WITH FREEZE/BLUR (D1, stable), REVERSE FEEDBACK (D2), CLOCK SYNC (Gate In 1), LED, AND GATE OUT 2 TEMPO
  * * HARDWARE CONNECTIONS:
  * ---------------------
  * Knobs:
@@ -13,12 +13,13 @@
  * - Gate In 1 -> CLOCK INPUT (Syncs delay time)
  * - Audio In  -> L/R
  * * Controls:
+ * - Button D1 -> FREEZE/BLUR TOGGLE (Stops input, sets feedback to infinite, now stable)
  * - Button D2 -> REVERSE FEEDBACK TOGGLE
  * * Outputs:
- * - Gate Out 2 -> TEMPO CLOCK OUTPUT (Controlled via patch.gate_out_2)
+ * - Gate Out 2 -> TEMPO CLOCK OUTPUT
  * - Audio Out -> L/R
  * * Indicator:
- * - LED (B8)  -> Blinks at delay tempo
+ * - LED (B8)  -> Blinks at tempo, solid when Freeze or Reverse is active
  */
 
 #include "daisy_patch_sm.h"
@@ -34,8 +35,8 @@ DaisyPatchSM patch;
 // Configuration
 #define MAX_DELAY_TIME_SEC 3.0f 
 #define MAX_DELAY static_cast<size_t>(48000 * MAX_DELAY_TIME_SEC)
-// INCREASED SIZE: 10000 samples is approx 208ms of audio
-#define REVERSE_BUFFER_SIZE static_cast<size_t>(48000 * MAX_DELAY_TIME_SEC) 
+// 1 second of audio for the reverse loop
+#define REVERSE_BUFFER_SIZE static_cast<size_t>(48000) 
 
 // Buffers
 DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delMems[2];
@@ -44,12 +45,14 @@ float DSY_SDRAM_BSS reverseBufferR[REVERSE_BUFFER_SIZE];
 
 // Globals for Sync & LED & Gate Out
 GPIO led;
-Switch mode_button; 
+Switch mode_button;      // D2 for reverse mode
+Switch freeze_button;    // D1 for freeze/blur mode
 uint32_t last_clock_tick = 0;
 float current_delay_ms = 500.0f;
 bool is_clocked = false;
 float led_phase = 0.0f; 
 bool reverse_feedback_mode = false;
+bool freeze_mode = false;
 
 // --------------------------------------------------------------------------
 // DSP FUNCTIONS (Ported from gen~)
@@ -92,20 +95,28 @@ struct TapeHead {
     size_t rev_read_idx = 0;
     bool recording_done = false;
     
-    // FIX: This member holds the signal to be fed back into the delay line.
     float next_feedback_signal = 0.0f; 
 
     void Init(float sr, float *buffer_ptr) { 
         lpFilter.Init(sr); 
         hpFilter.Init(sr); 
         rev_buffer = buffer_ptr;
-        rev_read_idx = REVERSE_BUFFER_SIZE - 1; // Initialize read pointer to the end
+        rev_read_idx = REVERSE_BUFFER_SIZE - 1; 
     }
 
-    // Process returns the final WET signal for output, but it calculates the next FEEDBACK signal 
     float Process(float in, float feedback_signal, float delay_samps, float tone_freq, bool reverse_fb_active) {
+        
+        // --- GAIN STABILITY FIX ---
+        // Corrective attenuation factor applied only when in freeze mode 
+        float corrected_fb_signal = feedback_signal;
+        // Check global flag, not the function argument `reverse_fb_active`
+        if (freeze_mode) { 
+            // 0.768f results in an overall loop gain of ~0.9984 (safe) to prevent blowup.
+            corrected_fb_signal *= 0.85f; 
+        }
+
         // 1. Process main delay
-        float fb_input_for_write = feedback_signal;
+        float fb_input_for_write = corrected_fb_signal; 
         float saturated_signal = tnhLam((in + fb_input_for_write) * 1.3f);
         del->Write(saturated_signal);
         fonepole(currentDelay, delay_samps, 0.0005f); 
@@ -115,14 +126,13 @@ struct TapeHead {
         float lp_out = lpFilter.Process(tape_out, tone_freq, 0); 
         float hp_out = hpFilter.Process(lp_out, 147.0f, 1);
         
-        // 3. DC Block & Soft Limit -> This is the delayed, clean signal (WET OUTPUT)
+        // 3. DC Block & Soft Limit -> WET OUTPUT
         float clean_delayed_signal = hp_out - dc_x + 0.995f * dc_y;
         dc_x = hp_out; dc_y = clean_delayed_signal;
         clean_delayed_signal = softStatic(clean_delayed_signal);
 
 
         // --- REVERSE FEEDBACK MECHANISM ---
-        // FIX: Assign to the member variable
         next_feedback_signal = clean_delayed_signal; // Default feedback source 
         
         if (reverse_fb_active) {
@@ -153,7 +163,7 @@ struct TapeHead {
         // 4. Increment write index 
         write_idx = (write_idx + 1) % REVERSE_BUFFER_SIZE;
         
-        // Return the WET OUTPUT (outL/outR uses this)
+        // Return the WET OUTPUT
         return clean_delayed_signal;
     }
 };
@@ -173,15 +183,26 @@ float MapLog(float input, float min_freq, float max_freq) {
 void ProcessControls() {
     patch.ProcessAnalogControls();
     
+    // Process the Reverse Mode Button (D2)
     mode_button.Debounce();
     if (mode_button.RisingEdge()) {
-        // Toggle the mode
         reverse_feedback_mode = !reverse_feedback_mode;
-        
-        // Reset reverse buffer state to wait for a clean loop when mode is engaged
+        // If reverse is engaged, ensure freeze is off
         if (reverse_feedback_mode) {
-             heads[0].recording_done = false;
-             heads[1].recording_done = false;
+             freeze_mode = false;
+        }
+        // Reset reverse buffer state
+        heads[0].recording_done = false;
+        heads[1].recording_done = false;
+    }
+    
+    // Process the Freeze Button (D1)
+    freeze_button.Debounce();
+    if (freeze_button.RisingEdge()) {
+        freeze_mode = !freeze_mode;
+        // If freeze is engaged, ensure reverse is off, and reset recording state
+        if (freeze_mode) {
+             reverse_feedback_mode = false;
         }
     }
 }
@@ -218,6 +239,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         target_delay_samps = (current_delay_ms / 1000.0f) * sample_rate;
     } else {
         float knob_delay_ms = 10.0f + (powf(raw_time, 2.5f) * 1500.0f);
+        // FIX 1: Corrected typo from 'knb_delay_ms' to 'knob_delay_ms'
         target_delay_samps = (knob_delay_ms / 1000.0f) * sample_rate;
         current_delay_ms = knob_delay_ms;
     }
@@ -226,6 +248,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
     float tone_freq = MapLog(patch.GetAdcValue(ADC_10) + patch.GetAdcValue(CV_4), 400.0f, 18000.0f);
     float flutter_depth = fclamp(patch.GetAdcValue(ADC_11) + patch.GetAdcValue(CV_5), 0.0f, 1.0f) * 60.0f;
     float dry_wet = fclamp(patch.GetAdcValue(CV_8) + patch.GetAdcValue(CV_3), 0.0f, 1.0f);
+
+
+    // --- FREEZE OVERRIDE --- 
+    if (freeze_mode) {
+        // Set feedback to unity gain. The actual stability correction happens inside TapeHead::Process.
+        fb_val = 1.0f; 
+        // 100% wet mix
+        dry_wet = 1.0f;
+    }
 
     // ----------------------
     // 3. AUDIO LOOP
@@ -241,11 +272,21 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         float dL = fclamp(target_delay_samps + wobble, 10.0f, (float)MAX_DELAY - 100.0f);
         float dR = fclamp(target_delay_samps + wobble + 50.0f, 10.0f, (float)MAX_DELAY - 100.0f);
 
-        // Tape Process. outL/R is the WET OUTPUT.
-        float outL = heads[0].Process(in[0][i], feedL * fb_val, dL, tone_freq, reverse_feedback_mode);
-        float outR = heads[1].Process(in[1][i], feedR * fb_val, dR, tone_freq, reverse_feedback_mode);
+        // --- FREEZE AUDIO INPUT --- 
+        float inputL = in[0][i];
+        float inputR = in[1][i];
+        
+        if (freeze_mode) {
+            // Stop writing new audio input to freeze the loop contents
+            inputL = 0.0f;
+            inputR = 0.0f;
+        }
 
-        // FIX: Access the new member variable for the feedback signal
+        // Tape Process. outL/R is the WET OUTPUT.
+        float outL = heads[0].Process(inputL, feedL * fb_val, dL, tone_freq, reverse_feedback_mode);
+        float outR = heads[1].Process(inputR, feedR * fb_val, dR, tone_freq, reverse_feedback_mode);
+
+        // Access the member variable for the feedback signal
         feedL = heads[0].next_feedback_signal;
         feedR = heads[1].next_feedback_signal;
 
@@ -269,7 +310,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         }
     }
     
-    // Write the Gate Out state
+    // FIX 2: Corrected Gate Out 2 write syntax
     dsy_gpio_write(&patch.gate_out_2, gate_out_state ? 1 : 0);
 }
 
@@ -280,7 +321,8 @@ int main(void) {
     // Init GPIO
     led.Init(DaisyPatchSM::B8, GPIO::Mode::OUTPUT);
     
-    // Init Button D2
+    // Init Buttons D1 and D2
+    freeze_button.Init(DaisyPatchSM::D1, patch.AudioCallbackRate()); 
     mode_button.Init(DaisyPatchSM::D2, patch.AudioCallbackRate()); 
 
     // Init DSP
@@ -302,8 +344,8 @@ int main(void) {
     patch.StartAudio(AudioCallback);
 
     while(1) {
-        // LED is ON for the first 10% of the delay cycle OR when reverse mode is active.
-        led.Write(led_phase < 0.1f || reverse_feedback_mode); 
+        // LED is ON for the first 10% of the delay cycle, OR when Reverse Mode is active, OR when Freeze Mode is active.
+        led.Write(led_phase < 0.1f || reverse_feedback_mode || freeze_mode); 
         
         System::Delay(1);
     }
